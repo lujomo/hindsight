@@ -718,7 +718,11 @@ ask() { (( ASSUME_YES )) && return 0; confirm "$1"; }
 
 # snapshot_has SNAP PATH — does PATH exist in the snapshot?
 snapshot_has() {
-  restic_cmd ls --json --host "$HOST_ID" "$1" "$SRC_PREFIX$2" 2>/dev/null | grep -q '"struct_type":"node"'
+  # Read restic's whole output first: `| grep -q` would close the pipe early,
+  # and with pipefail restic's SIGPIPE turns a match into a failure.
+  local out
+  out=$(restic_cmd ls --json --host "$HOST_ID" "$1" "$SRC_PREFIX$2" 2>/dev/null)
+  [[ $out == *'"struct_type":"node"'* ]]
 }
 
 # restore_subtree SNAP PATH [restic args...] — PATH from the snapshot onto the same PATH here.

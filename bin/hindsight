@@ -684,8 +684,11 @@ cmd_restore() {
   log "Restoring ${paths[*]} from $snap into $target"
   restic_cmd restore "$snap" --host "$HOST_ID" --target "$target" "${inc[@]}" || die "Restore failed."
 
+  # A restored copy in ~/Restored is the user's to keep or delete, including the
+  # parent folders (like /home, owned by root) that restic recreates around it.
   if [[ -n ${default_target:-} && $owner != root ]]; then
-    chown "$owner": "$home/Restored" "$target" 2>/dev/null
+    chown -R "$owner": "$target" 2>/dev/null
+    chown "$owner": "$home/Restored" 2>/dev/null
   fi
   echo "Restored into: $target"
 }

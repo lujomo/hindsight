@@ -1,0 +1,56 @@
+{
+  "title": "Hindsight",
+  "notSetUp": "Backups are not set up — click to set up",
+  "running": "Backing up… %1%",
+  "runningPhase": "%1… %2%",
+  "lastBackup": "Last backup: %1",
+  "never": "No backups yet",
+  "driveConnected": "Backup drive connected",
+  "driveMissing": "Backup drive not connected",
+  "overdue": "No backup for %1 — connect your backup drive",
+  "error": "Last backup failed: %1",
+  "justNow": "just now",
+  "minutesAgo": {
+    "one": "%1 minute ago",
+    "other": "%1 minutes ago"
+  },
+  "hoursAgo": {
+    "one": "%1 hour ago",
+    "other": "%1 hours ago"
+  },
+  "daysAgo": {
+    "one": "%1 day ago",
+    "other": "%1 days ago"
+  },
+  "days": {
+    "one": "%1 day",
+    "other": "%1 days"
+  },
+  "failedNotifyTitle": "Backup failed",
+  "failedShort": "Last backup failed",
+  "todayAt": "Today, %1",
+  "nextRunning": "Backing up now",
+  "nextWhenConnected": "When the drive is connected",
+  "nextSoon": "Within the hour",
+  "inMinutes": {
+    "one": "In %1 minute",
+    "other": "In %1 minutes"
+  },
+  "runningHint": "You can keep working; the first backup takes the longest.",
+  "neverShort": "Never",
+  "setUp": "Set up backups",
+  "labelLast": "Last backup",
+  "labelNext": "Next backup",
+  "labelKept": "Backups kept",
+  "labelOldest": "Oldest backup",
+  "labelAdded": "Added last time",
+  "stop": "Stop",
+  "backUpNow": "Back Up Now",
+  "browse": "Browse",
+  "recent": "Recent backups",
+  "tagManual": "manual",
+  "tagAuto": "hourly",
+  "eject": "Eject drive",
+  "ejecting": "Ejecting…",
+  "more": "More options"
+}

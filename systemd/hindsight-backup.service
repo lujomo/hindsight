@@ -1,0 +1,13 @@
+[Unit]
+Description=Hindsight backup (automatic, when due)
+Documentation=https://github.com/lujomo/hindsight
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hindsight backup --auto
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+# Let the drive finish spinning up after being plugged in.
+ExecStartPre=/usr/bin/sleep 5

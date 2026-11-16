@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "hindsight.backup",
+  "name": "Hindsight",
+  "version": "0.1.0",
+  "author": "Hindsight",
+  "license": "MIT",
+  "description": "Time Machine-style backup status in the Omarchy bar.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Backup.qml"
+  },
+  "barWidget": {
+    "displayName": "Hindsight backups",
+    "description": "Shows when the last backup ran. Click for the backup menu, right-click to back up now.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

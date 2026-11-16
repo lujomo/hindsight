@@ -1,0 +1,1151 @@
+#!/usr/bin/env bash
+# Hindsight — Time Machine-style backups for Omarchy (Arch Linux), built on restic.
+# https://github.com/lujomo/hindsight — MIT licensed.
+#
+# Run `hindsight help` for usage.
+
+set -uo pipefail
+
+VERSION="0.1.0"
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# Every location can be overridden through the environment, which is how the
+# test suite runs Hindsight without root and without a real drive.
+ETC_DIR=${HINDSIGHT_ETC:-/etc/hindsight}
+STATE_DIR=${HINDSIGHT_STATE:-/var/lib/hindsight}
+RUN_DIR=${HINDSIGHT_RUN:-/run/hindsight}
+CACHE_DIR=${HINDSIGHT_CACHE:-/var/cache/hindsight}
+RESTIC=${HINDSIGHT_RESTIC:-restic}
+UDEV_RULE=${HINDSIGHT_UDEV_RULE:-/etc/udev/rules.d/90-hindsight.rules}
+
+CONFIG_FILE=$ETC_DIR/hindsight.conf
+PASSWORD_FILE=$ETC_DIR/password
+EXCLUDE_FILE=$ETC_DIR/excludes
+STATUS_FILE=$STATE_DIR/status.json
+META_DIR=$STATE_DIR/meta
+LOG_FILE=$STATE_DIR/last-backup.log
+# World-readable list of backups (times and IDs only), so the bar and
+# `hindsight list` can show them without root.
+SNAPSHOTS_FILE=$STATE_DIR/snapshots.json
+
+REPO_DIR_NAME="Hindsight"
+
+# Files that describe *this* disk layout. A full-system restore onto a new disk
+# must keep the new installation's versions of these, or it will not boot.
+DISK_BOUND_EXCLUDES=(
+  /boot
+  /etc/fstab
+  /etc/crypttab
+  /etc/kernel/cmdline
+  /etc/default/limine
+  /swap
+)
+
+MNT=""
+MOUNTED_BY_US=0
+IN_BACKUP=0
+
+# ---------------------------------------------------------------- helpers ---
+
+log()  { printf '%s\n' "hindsight: $*" >&2; }
+warn() { printf '%s\n' "hindsight: warning: $*" >&2; }
+
+die() {
+  log "$*"
+  if (( IN_BACKUP )); then
+    status_update '.state="error" | .last_error=$e | .last_attempt=now' --arg e "$*"
+  fi
+  exit 1
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+require_root() {
+  [[ $EUID -eq 0 || -n ${HINDSIGHT_ALLOW_NONROOT:-} ]] || die "This needs root. Try: sudo hindsight $*"
+}
+
+confirm() {
+  local prompt=$1
+  if have gum && [[ -t 0 ]]; then
+    gum confirm "$prompt"
+  else
+    local reply
+    read -r -p "$prompt [y/N] " reply
+    [[ $reply =~ ^[Yy] ]]
+  fi
+}
+
+choose() { # choose "Header" option...
+  local header=$1; shift
+  if have gum && [[ -t 0 ]]; then
+    gum choose --header "$header" "$@"
+  else
+    local PS3="$header "
+    select opt in "$@"; do [[ -n $opt ]] && { printf '%s\n' "$opt"; return 0; }; done
+    return 1
+  fi
+}
+
+read_secret() { # read_secret "Prompt"
+  local prompt=$1 value
+  if have gum && [[ -t 0 ]]; then
+    gum input --password --placeholder "$prompt" --prompt "$prompt: "
+  else
+    read -r -s -p "$prompt: " value; echo >&2
+    printf '%s' "$value"
+  fi
+}
+
+human_bytes() {
+  numfmt --to=iec-i --suffix=B --format='%.1f' "${1:-0}" 2>/dev/null || printf '%sB' "${1:-0}"
+}
+
+ago() { # ago EPOCH
+  local s=$(( $(date +%s) - $1 ))
+  if   (( s < 90 ));     then echo "just now"
+  elif (( s < 5400 ));   then echo "$(( s / 60 )) minutes ago"
+  elif (( s < 129600 )); then echo "$(( s / 3600 )) hours ago"
+  else                        echo "$(( s / 86400 )) days ago"
+  fi
+}
+
+# ------------------------------------------------------------ configuration ---
+
+load_defaults() {
+  DRIVE_UUID=""
+  HOST_ID=$(hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo localhost)
+  INTERVAL_MINUTES=60
+  BACKUP_PATHS="/ /boot /home /var/log"
+  KEEP_HOURLY=24
+  KEEP_DAILY=30
+  KEEP_WEEKLY=52
+  KEEP_MONTHLY=120
+  MIN_FREE_GB=20
+  PRUNE_EVERY_DAYS=7
+  REPOSITORY=""   # Optional: use this restic repository instead of a drive.
+}
+
+load_config() {
+  load_defaults
+  # shellcheck source=/dev/null
+  [[ -r $CONFIG_FILE ]] && source "$CONFIG_FILE"
+  return 0
+}
+
+load_config_or_die() {
+  [[ -f $CONFIG_FILE ]] || die "Hindsight is not set up yet. Run: sudo hindsight setup"
+  load_config
+  [[ -n $DRIVE_UUID || -n $REPOSITORY ]] || die "No backup drive configured. Run: sudo hindsight setup"
+}
+
+write_config() {
+  mkdir -p "$ETC_DIR"
+  umask 022
+  cat >"$CONFIG_FILE" <<EOF
+# Hindsight configuration. Edit freely; changes apply to the next backup.
+
+# Filesystem UUID of the backup drive partition (see: lsblk -f).
+DRIVE_UUID="$DRIVE_UUID"
+
+# Name of this computer's backup set on the drive (<drive>/Hindsight/<HOST_ID>).
+HOST_ID="$HOST_ID"
+
+# Minutes between automatic backups while the drive is connected.
+INTERVAL_MINUTES=$INTERVAL_MINUTES
+
+# What to back up. Each path is backed up without crossing into other
+# filesystems, so list every mount you want included.
+BACKUP_PATHS="$BACKUP_PATHS"
+
+# How many backups to keep, Time Machine style: hourly for a day, daily for a
+# month, weekly for a year, then monthly.
+KEEP_HOURLY=$KEEP_HOURLY
+KEEP_DAILY=$KEEP_DAILY
+KEEP_WEEKLY=$KEEP_WEEKLY
+KEEP_MONTHLY=$KEEP_MONTHLY
+
+# When the drive has less free space than this, the oldest backups are removed.
+MIN_FREE_GB=$MIN_FREE_GB
+
+# How often unreferenced data is pruned from the drive and the repository checked.
+PRUNE_EVERY_DAYS=$PRUNE_EVERY_DAYS
+EOF
+  chmod 644 "$CONFIG_FILE"
+}
+
+write_default_excludes() {
+  [[ -f $EXCLUDE_FILE ]] && return 0
+  cat >"$EXCLUDE_FILE" <<'EOF'
+# Paths Hindsight never backs up (restic --exclude-file syntax: one pattern
+# per line, * matches within a path segment, ** across segments).
+# Folders containing a CACHEDIR.TAG file are skipped automatically.
+
+# Runtime and virtual filesystems
+/proc
+/sys
+/dev
+/run
+/tmp
+/mnt
+/media
+/lost+found
+
+# Caches and scratch space that rebuild themselves
+/var/tmp
+/var/cache
+/var/lib/systemd/coredump
+/root/.cache
+/home/*/.cache
+/home/*/.local/share/Trash
+
+# Swap and local btrfs snapshots (snapper)
+/swap
+/.snapshots
+/home/.snapshots
+
+# Large re-downloadable data — uncomment what you don't need backed up
+# /var/lib/docker
+# /home/*/.local/share/Steam
+# /home/*/.local/share/containers
+EOF
+  chmod 644 "$EXCLUDE_FILE"
+}
+
+# ------------------------------------------------------------------ status ---
+
+status_read() {
+  local s
+  s=$(cat "$STATUS_FILE" 2>/dev/null) || s='{}'
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$s" || s='{}'
+  printf '%s' "$s"
+}
+
+status_get() { # status_get .key default
+  local v
+  v=$(status_read | jq -r "$1 // empty" 2>/dev/null)
+  printf '%s' "${v:-$2}"
+}
+
+# status_update JQ_FILTER [jq args...]  — atomic, world-readable status file.
+status_update() {
+  local filter=$1; shift
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/.status.XXXXXX" 2>/dev/null) || return 0
+  if status_read | jq "$@" "$filter" >"$tmp" 2>/dev/null; then
+    chmod 644 "$tmp"
+    mv -f "$tmp" "$STATUS_FILE"
+  else
+    rm -f "$tmp"
+  fi
+}
+
+# -------------------------------------------------------------- the drive ---
+
+drive_device() { printf '/dev/disk/by-uuid/%s' "$DRIVE_UUID"; }
+
+drive_present() {
+  [[ -n $REPOSITORY ]] && return 0
+  [[ -n $DRIVE_UUID && -e $(drive_device) ]]
+}
+
+cleanup() {
+  if (( MOUNTED_BY_US )) && [[ -n $MNT ]]; then
+    sync
+    umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null
+    rmdir "$MNT" 2>/dev/null
+    MOUNTED_BY_US=0
+  fi
+}
+trap cleanup EXIT
+
+# Mounts the backup drive if nothing else has, and sets MNT.
+mount_drive() {
+  if [[ -n $REPOSITORY ]]; then MNT=""; return 0; fi
+  drive_present || die "The backup drive is not connected."
+  MNT=$(findmnt -rn -S "UUID=$DRIVE_UUID" -o TARGET 2>/dev/null | head -n1)
+  # findmnt -r escapes spaces in mount points as \x20.
+  MNT=$(printf '%b' "$MNT")
+  if [[ -z $MNT ]]; then
+    MNT=$RUN_DIR/drive
+    mkdir -p "$MNT"
+    mount "$(drive_device)" "$MNT" || die "Could not mount the backup drive."
+    MOUNTED_BY_US=1
+  fi
+  [[ -w $MNT ]] || die "The backup drive at $MNT is not writable."
+}
+
+# Points restic at this computer's repository. Call after mount_drive.
+use_repo() {
+  if [[ -n $REPOSITORY ]]; then
+    export RESTIC_REPOSITORY=$REPOSITORY
+  else
+    export RESTIC_REPOSITORY=$MNT/$REPO_DIR_NAME/$HOST_ID
+  fi
+  [[ -r $PASSWORD_FILE ]] && export RESTIC_PASSWORD_FILE=$PASSWORD_FILE
+  export RESTIC_CACHE_DIR=$CACHE_DIR
+}
+
+repo_exists() { [[ -f $RESTIC_REPOSITORY/config ]]; }
+
+restic_cmd() { "$RESTIC" "$@"; }
+
+# -------------------------------------------------------------- metadata ---
+
+# A description of the system saved with each backup, so a fresh install can be
+# rebuilt from it (`hindsight migrate`) and a person can see what was there.
+write_metadata() {
+  mkdir -p "$META_DIR"
+  {
+    pacman -Qqen >"$META_DIR/pkglist-native.txt"
+    pacman -Qqem >"$META_DIR/pkglist-foreign.txt"
+    systemctl list-unit-files --state=enabled --no-legend >"$META_DIR/enabled-units.txt"
+    lsblk -f >"$META_DIR/lsblk.txt"
+    cp -f /etc/fstab "$META_DIR/fstab" 2>/dev/null
+    uname -a >"$META_DIR/uname.txt"
+    { /usr/share/omarchy/bin/omarchy-version 2>/dev/null || cat /usr/share/omarchy/version 2>/dev/null; } >"$META_DIR/omarchy-version.txt"
+    getent passwd | awk -F: '$3 >= 1000 && $3 < 60000 {print $1":"$3":"$6}' >"$META_DIR/users.txt"
+  } 2>/dev/null
+  jq -n --arg host "$HOST_ID" --arg version "$VERSION" --arg date "$(date -Is)" \
+    '{host: $host, hindsight: $version, date: $date}' >"$META_DIR/info.json"
+  return 0
+}
+
+# Keeps a copy of the tools and restore instructions on the drive itself, so a
+# restore from a live USB doesn't depend on anything else.
+write_drive_extras() {
+  [[ -z $MNT ]] && return 0
+  local base=$MNT/$REPO_DIR_NAME
+  mkdir -p "$base/tools" 2>/dev/null || return 0
+  cp -f "$SELF" "$base/tools/hindsight" 2>/dev/null
+  local rbin; rbin=$(command -v "$RESTIC")
+  if [[ -n $rbin ]] && ! cmp -s "$rbin" "$base/tools/restic"; then cp -f "$rbin" "$base/tools/restic" 2>/dev/null; fi
+  cat >"$base/README.txt" <<'EOF'
+HINDSIGHT BACKUPS
+=================
+
+This drive holds Hindsight backups (encrypted restic repositories), one folder
+per computer. You need the backup password to read them.
+
+  Browse or restore files on a working Omarchy system:
+    hindsight browse              (open backups in the file manager)
+    sudo hindsight restore PATH   (restore a file or folder)
+
+  Rebuild a fresh Omarchy install from a backup:
+    sudo hindsight setup          (choose this drive and the old computer's name)
+    sudo hindsight migrate
+
+  Full system restore from a live USB (see tools/ for copies of the programs):
+    cp tools/restic tools/hindsight /tmp && chmod +x /tmp/restic /tmp/hindsight
+    sudo HINDSIGHT_RESTIC=/tmp/restic /tmp/hindsight restore-system \
+         --repo "/path/to/drive/Hindsight/<computer>" --target /mnt
+
+Any restic (https://restic.net) can also read these repositories directly:
+    restic -r "/path/to/drive/Hindsight/<computer>" snapshots
+EOF
+}
+
+# ------------------------------------------------------------- retention ---
+
+forget_old() {
+  restic_cmd forget --quiet --host "$HOST_ID" --group-by host \
+    --keep-hourly "$KEEP_HOURLY" --keep-daily "$KEEP_DAILY" \
+    --keep-weekly "$KEEP_WEEKLY" --keep-monthly "$KEEP_MONTHLY" >/dev/null \
+    || warn "Could not apply the retention policy."
+}
+
+free_gb() { df -P --block-size=1G "$1" 2>/dev/null | awk 'NR==2 {print $4}'; }
+
+# Like Time Machine: when the drive is filling up, delete the oldest backups.
+make_room() {
+  [[ -z $MNT ]] && return 0
+  local free; free=$(free_gb "$MNT")
+  [[ -z $free ]] && return 0
+  (( free >= MIN_FREE_GB )) && return 0
+  log "Only ${free}G free on the backup drive; removing the oldest backups."
+  status_update '.phase="Making room on the drive"'
+  local ids
+  while (( free < MIN_FREE_GB )); do
+    mapfile -t ids < <(restic_cmd snapshots --json --host "$HOST_ID" 2>/dev/null | jq -r 'sort_by(.time) | .[].short_id')
+    (( ${#ids[@]} > 2 )) || { warn "Drive is nearly full and there are no old backups left to remove."; return 0; }
+    restic_cmd forget --quiet "${ids[0]}" >/dev/null || return 0
+    restic_cmd prune --quiet >/dev/null || return 0
+    status_update '.last_prune=now'
+    free=$(free_gb "$MNT")
+  done
+}
+
+maybe_prune() {
+  local last; last=$(status_get .last_prune 0)
+  last=${last%.*}
+  (( $(date +%s) - last >= PRUNE_EVERY_DAYS * 86400 )) || return 0
+  status_update '.phase="Cleaning up old backups"'
+  log "Pruning unreferenced data and checking the repository."
+  if restic_cmd prune --quiet >/dev/null; then
+    status_update '.last_prune=now'
+  else
+    warn "Prune failed."
+  fi
+  if restic_cmd check --quiet >/dev/null 2>&1; then
+    status_update '.last_check=now | .check_ok=true'
+  else
+    status_update '.last_check=now | .check_ok=false'
+    warn "Repository check reported problems. Run: sudo hindsight check"
+  fi
+}
+
+record_snapshot_stats() {
+  local snaps tmp
+  snaps=$(restic_cmd snapshots --json --host "$HOST_ID" 2>/dev/null) || return 0
+  tmp=$(mktemp "$STATE_DIR/.snapshots.XXXXXX") || return 0
+  if jq 'map({id: .short_id, time: .time, tags: (.tags // [])}) | sort_by(.time) | reverse' <<<"$snaps" >"$tmp"; then
+    chmod 644 "$tmp"; mv -f "$tmp" "$SNAPSHOTS_FILE"
+  else
+    rm -f "$tmp"
+  fi
+  status_update '.snapshot_count=($s|length) | .oldest_snapshot=($s|map(.time)|min) | .newest_snapshot=($s|map(.time)|max)' \
+    --argjson s "$snaps"
+}
+
+# ---------------------------------------------------------------- backup ---
+
+cmd_backup() {
+  local auto=0 tag=manual
+  [[ ${1:-} == --auto ]] && { auto=1; tag=auto; }
+  require_root backup
+  load_config_or_die
+  have jq || die "jq is required."
+  have "$RESTIC" || die "restic is not installed (sudo pacman -S restic)."
+
+  mkdir -p "$RUN_DIR" "$STATE_DIR" "$CACHE_DIR"
+  chmod 755 "$RUN_DIR" "$STATE_DIR"
+
+  exec 9>"$RUN_DIR/backup.lock"
+  flock -n 9 || { log "A backup is already running."; exit 0; }
+
+  if (( auto )); then
+    local last due
+    last=$(status_get .last_success 0); last=${last%.*}
+    due=$(( last + INTERVAL_MINUTES * 60 - 300 ))
+    if (( $(date +%s) < due )); then log "Not due yet (last backup $(ago "$last"))."; exit 0; fi
+    drive_present || { log "Backup drive not connected; nothing to do."; exit 0; }
+  fi
+
+  IN_BACKUP=1
+  status_update '.state="running" | .phase="Preparing" | .percent=0 | .pid=($p|tonumber) | .started_at=now | .last_attempt=now' \
+    --arg p "$$"
+
+  mount_drive
+  use_repo
+  repo_exists || die "No Hindsight backups found at $RESTIC_REPOSITORY. Run: sudo hindsight setup"
+
+  restic_cmd unlock --quiet >/dev/null 2>&1   # clear locks left by an interrupted run
+  write_metadata
+  write_drive_extras
+  make_room
+
+  local -a paths=()
+  local p
+  for p in $BACKUP_PATHS; do [[ -e $p ]] && paths+=("$p"); done
+  (( ${#paths[@]} )) || die "None of the backup paths exist: $BACKUP_PATHS"
+
+  local -a excl=(--exclude-caches)
+  [[ -r $EXCLUDE_FILE ]] && excl+=(--exclude-file "$EXCLUDE_FILE")
+  # Never back up the backup drive, the repository cache or the browse mount.
+  excl+=(--exclude "$RUN_DIR" --exclude "$CACHE_DIR")
+  [[ -n $MNT ]] && excl+=(--exclude "$MNT")
+
+  log "Backing up ${paths[*]} to $RESTIC_REPOSITORY"
+  status_update '.phase="Backing up"'
+
+  local summary=$RUN_DIR/summary.json
+  rm -f "$summary"
+  : >"$LOG_FILE"; chmod 644 "$LOG_FILE"
+
+  local last_write=0 line pct now
+  RESTIC_PROGRESS_FPS=0.5 restic_cmd backup --json --one-file-system "${excl[@]}" \
+      --host "$HOST_ID" --tag "$tag" "${paths[@]}" 2>>"$LOG_FILE" |
+    while IFS= read -r line; do
+      case $line in
+        *'"message_type":"status"'*)
+          now=$(date +%s)
+          if (( now - last_write >= 2 )); then
+            last_write=$now
+            pct=$(jq -r '((.percent_done // 0) * 100 | floor)' <<<"$line" 2>/dev/null)
+            [[ $pct =~ ^[0-9]+$ ]] && status_update '.percent=($p|tonumber)' --arg p "$pct"
+          fi ;;
+        *'"message_type":"summary"'*) printf '%s\n' "$line" >"$summary" ;;
+      esac
+    done
+  local rc=${PIPESTATUS[0]}
+
+  if [[ $rc -ne 0 && $rc -ne 3 ]] || [[ ! -s $summary ]]; then
+    local reason
+    reason=$(grep -v '^{' "$LOG_FILE" | grep -v '^\s*$' | tail -n1)
+    [[ -z $reason ]] && reason=$(jq -Rr 'fromjson? | select(.message_type=="error") | .error.message // empty' "$LOG_FILE" 2>/dev/null | tail -n1)
+    [[ $rc -eq 130 ]] && reason="Backup was interrupted"
+    die "Backup failed (restic exit $rc): ${reason:-see $LOG_FILE}"
+  fi
+
+  local snap added files secs warnings=0
+  snap=$(jq -r '.snapshot_id // ""' "$summary")
+  added=$(jq -r '.data_added // 0' "$summary")
+  files=$(jq -r '.total_files_processed // 0' "$summary")
+  secs=$(jq -r '.total_duration // 0 | floor' "$summary")
+  [[ $rc -eq 3 ]] && warnings=$(grep -c '"message_type":"error"' "$LOG_FILE")
+
+  status_update '.phase="Finishing" | .last_success=now | .last_snapshot=$s | .last_added=($a|tonumber)
+                 | .last_files=($f|tonumber) | .last_duration=($d|tonumber) | .last_warnings=($w|tonumber)
+                 | .last_error=null' \
+    --arg s "${snap:0:8}" --arg a "$added" --arg f "$files" --arg d "$secs" --arg w "$warnings"
+
+  forget_old
+  maybe_prune
+  record_snapshot_stats
+
+  IN_BACKUP=0
+  status_update '.state="idle" | .phase="" | .percent=100 | .pid=null'
+  log "Backup ${snap:0:8} complete: $files files, $(human_bytes "$added") new, ${secs}s."
+  (( warnings )) && warn "$warnings files could not be read; see $LOG_FILE"
+  return 0
+}
+
+# ---------------------------------------------------------------- status ---
+
+cmd_status() {
+  local json=0
+  [[ ${1:-} == --json ]] && json=1
+  local configured=false connected=false
+  if [[ -f $CONFIG_FILE ]]; then configured=true; fi
+  load_config
+  drive_present && [[ $configured == true ]] && connected=true
+
+  local st; st=$(status_read)
+  local state pid
+  state=$(jq -r '.state // "idle"' <<<"$st")
+  pid=$(jq -r '.pid // empty' <<<"$st")
+  if [[ $state == running ]] && [[ -z $pid || ! -d /proc/$pid ]]; then
+    st=$(jq '.state="error" | .last_error="The last backup was interrupted"' <<<"$st")
+  fi
+
+  local recent='[]'
+  [[ -r $SNAPSHOTS_FILE ]] && recent=$(jq -c '.[0:8]' "$SNAPSHOTS_FILE" 2>/dev/null || echo '[]')
+  st=$(jq --argjson c "$configured" --argjson d "$connected" --arg i "$INTERVAL_MINUTES" \
+           --arg h "$HOST_ID" --argjson r "${recent:-[]}" \
+       '. + {configured: $c, drive_connected: $d, interval_minutes: ($i|tonumber), host: $h, now: now,
+             recent: $r,
+             next_due: (if (.last_success // 0) > 0 then (.last_success + ($i|tonumber) * 60) else null end)}' <<<"$st")
+
+  if (( json )); then printf '%s\n' "$st"; return 0; fi
+
+  if [[ $configured != true ]]; then echo "Hindsight is not set up. Run: sudo hindsight setup"; return 0; fi
+  local last; last=$(jq -r '.last_success // 0 | floor' <<<"$st")
+  echo "Backup set:    $HOST_ID"
+  echo "Drive:         $([[ $connected == true ]] && echo connected || echo 'not connected')"
+  echo "State:         $(jq -r '.state // "idle"' <<<"$st")$(jq -r 'if .state=="running" then " — \(.phase) \(.percent // 0)%" else "" end' <<<"$st")"
+  if (( last > 0 )); then
+    echo "Last backup:   $(date -d "@$last" '+%a %d %b %Y %H:%M') ($(ago "$last"))"
+  else
+    echo "Last backup:   never"
+  fi
+  jq -r 'if .snapshot_count then "Backups kept:  \(.snapshot_count) (oldest \(.oldest_snapshot[0:10]))" else empty end' <<<"$st"
+  jq -r 'if .state=="error" and .last_error then "Last error:    \(.last_error)" else empty end' <<<"$st"
+}
+
+# ------------------------------------------------------------------- now ---
+
+cmd_now() {
+  local unit=hindsight-backup-now.service
+  if [[ -n ${HINDSIGHT_NO_SYSTEMD:-} ]]; then
+    exec "$SELF" backup
+  fi
+  systemctl start --no-block "$unit" || die "Could not start $unit."
+  [[ ${1:-} == --follow || -t 1 ]] || return 0
+  echo "Backing up… (you can close this window; the backup continues)"
+  local state pct phase seen=0
+  for _ in $(seq 1 7200); do
+    sleep 1
+    state=$(status_get .state idle)
+    if [[ $state == running ]]; then
+      seen=1
+      pct=$(status_get .percent 0); phase=$(status_get .phase "")
+      printf '\r\033[K%s %s%%' "$phase" "$pct"
+    elif (( seen )) || [[ $(systemctl show -P ActiveState "$unit") != @(activating|active) ]]; then
+      break
+    fi
+  done
+  echo
+  cmd_status
+}
+
+# ------------------------------------------------------------------ list ---
+
+cmd_list() {
+  if [[ $EUID -ne 0 && -z ${HINDSIGHT_ALLOW_NONROOT:-} ]]; then
+    [[ -r $SNAPSHOTS_FILE ]] || { echo "No backups recorded yet."; return 0; }
+    jq -r '.[] | "\(.id)  \(.time[0:16] | sub("T"; " "))  \(.tags | join(","))"' "$SNAPSHOTS_FILE"
+    return 0
+  fi
+  load_config_or_die
+  mount_drive; use_repo
+  repo_exists || die "No backups found at $RESTIC_REPOSITORY"
+  restic_cmd snapshots --host "$HOST_ID" "$@"
+}
+
+cmd_check() {
+  require_root check
+  load_config_or_die
+  mount_drive; use_repo
+  restic_cmd check "$@"
+}
+
+# ---------------------------------------------------------------- browse ---
+
+cmd_browse() {
+  [[ $EUID -eq 0 ]] && die "Run 'hindsight browse' as your normal user; it asks for your password itself."
+  local mp=$RUN_DIR/browse
+  sudo -v || die "Browsing backups needs administrator access."
+  sudo "$SELF" _mount &
+  local mpid=$!
+  local i
+  for i in $(seq 1 120); do
+    [[ -d $mp/snapshots ]] && break
+    kill -0 "$mpid" 2>/dev/null || die "Could not open the backups."
+    sleep 0.5
+  done
+  [[ -d $mp/snapshots ]] || { sudo "$SELF" _umount; die "Timed out opening the backups."; }
+
+  trap 'sudo "$SELF" _umount; wait "$mpid" 2>/dev/null; exit 0' INT TERM
+  setsid -f xdg-open "$mp/snapshots" >/dev/null 2>&1
+  echo
+  echo "Your backups are open in Files: one folder per backup, newest is 'latest'."
+  echo "Copy anything you need back to your home folder."
+  echo
+  read -r -p "Press Enter when you're done to close the backups. " _
+  sudo "$SELF" _umount
+  wait "$mpid" 2>/dev/null
+}
+
+cmd__mount() {
+  require_root
+  load_config_or_die
+  mount_drive; use_repo
+  repo_exists || die "No backups found at $RESTIC_REPOSITORY"
+  local mp=$RUN_DIR/browse
+  mkdir -p "$mp"; chmod 755 "$RUN_DIR" "$mp"
+  restic_cmd mount --allow-other --host "$HOST_ID" "$mp"
+}
+
+cmd__umount() {
+  require_root
+  local mp=$RUN_DIR/browse
+  mountpoint -q "$mp" && { umount "$mp" 2>/dev/null || fusermount3 -u "$mp" 2>/dev/null || umount -l "$mp"; }
+  return 0
+}
+
+# --------------------------------------------------------------- restore ---
+
+cmd_restore() {
+  require_root restore
+  local snap=latest target="" inplace=0 yes=0
+  local -a paths=()
+  while (( $# )); do
+    case $1 in
+      --snapshot|-s) snap=$2; shift 2 ;;
+      --to|-t)       target=$2; shift 2 ;;
+      --in-place)    inplace=1; shift ;;
+      --yes|-y)      yes=1; shift ;;
+      -*)            die "Unknown option $1" ;;
+      *)             paths+=("$(realpath -m "$1")"); shift ;;
+    esac
+  done
+  (( ${#paths[@]} )) || die "Usage: sudo hindsight restore [--snapshot ID] [--to DIR | --in-place] PATH..."
+
+  load_config_or_die
+  mount_drive; use_repo
+  repo_exists || die "No backups found at $RESTIC_REPOSITORY"
+
+  local owner=${SUDO_USER:-root} home
+  home=$(getent passwd "$owner" | cut -d: -f6)
+  if (( inplace )); then
+    target=/
+    if (( ! yes )); then
+      confirm "Overwrite ${paths[*]} with the versions from backup '$snap'?" || exit 1
+    fi
+  elif [[ -z $target ]]; then
+    target="$home/Restored/$(date +%Y-%m-%d_%H%M%S)"
+    local default_target=1
+  fi
+  mkdir -p "$target"
+
+  local -a inc=()
+  local p
+  for p in "${paths[@]}"; do inc+=(--include "$p"); done
+  log "Restoring ${paths[*]} from $snap into $target"
+  restic_cmd restore "$snap" --host "$HOST_ID" --target "$target" "${inc[@]}" || die "Restore failed."
+
+  if [[ -n ${default_target:-} && $owner != root ]]; then
+    chown "$owner": "$home/Restored" "$target" 2>/dev/null
+  fi
+  echo "Restored into: $target"
+}
+
+# Snapshot paths are the real system paths. The test suite backs up a fake
+# system tree, so it sets HINDSIGHT_SOURCE_PREFIX (where that tree lives inside
+# the snapshot) and HINDSIGHT_TARGET_ROOT (where to write instead of /).
+SRC_PREFIX=${HINDSIGHT_SOURCE_PREFIX:-}
+TARGET_ROOT=${HINDSIGHT_TARGET_ROOT:-}
+SYSTEM_META=/var/lib/hindsight/meta
+
+# Machine state outside /home and /etc that is worth bringing to a new install:
+# Bluetooth pairings, Wi-Fi (iwd), fingerprints, Thunderbolt authorisations,
+# user account pictures, Tailscale identity and cron jobs.
+MIGRATE_EXTRAS=(
+  /var/lib/bluetooth
+  /var/lib/iwd
+  /var/lib/fprint
+  /var/lib/boltd
+  /var/lib/AccountsService
+  /var/lib/tailscale
+  /var/spool/cron
+)
+
+ASSUME_YES=0
+ask() { (( ASSUME_YES )) && return 0; confirm "$1"; }
+
+# snapshot_has SNAP PATH — does PATH exist in the snapshot?
+snapshot_has() {
+  restic_cmd ls --json --host "$HOST_ID" "$1" "$SRC_PREFIX$2" 2>/dev/null | grep -q '"struct_type":"node"'
+}
+
+# restore_subtree SNAP PATH [restic args...] — PATH from the snapshot onto the same PATH here.
+restore_subtree() {
+  local snap=$1 path=$2; shift 2
+  mkdir -p "$TARGET_ROOT$path"
+  restic_cmd restore "$snap:$SRC_PREFIX$path" --host "$HOST_ID" --target "$TARGET_ROOT$path" "$@"
+}
+
+# Disk-bound files as --exclude arguments relative to a restored subtree (e.g. /etc).
+relative_excludes() {
+  local base=$1 e
+  # /etc/hindsight is the system path inside the backup, whatever ETC_DIR is here.
+  for e in "${DISK_BOUND_EXCLUDES[@]}" /etc/hindsight; do
+    [[ $e == "$base"/* ]] && printf '%s\n' --exclude "${e#"$base"}"
+  done
+  return 0
+}
+
+# Run from a live USB to put a whole backup onto a freshly prepared disk.
+cmd_restore_system() {
+  require_root restore-system
+  local repo="" target="" snap=latest host=""
+  while (( $# )); do
+    case $1 in
+      --repo)     repo=$2; shift 2 ;;
+      --target)   target=$2; shift 2 ;;
+      --snapshot) snap=$2; shift 2 ;;
+      --host)     host=$2; shift 2 ;;
+      --yes|-y)   ASSUME_YES=1; shift ;;
+      *) die "Unknown option $1" ;;
+    esac
+  done
+  [[ -n $repo && -n $target ]] || die "Usage: hindsight restore-system --repo DIR --target /mnt [--snapshot ID]"
+  [[ -f $repo/config ]] || die "$repo is not a Hindsight/restic repository."
+  if [[ -z ${HINDSIGHT_ALLOW_NONMOUNT:-} ]] && ! mountpoint -q "$target"; then
+    die "$target is not a mount point. Mount the new root filesystem there first."
+  fi
+  have "$RESTIC" || die "restic not found. Set HINDSIGHT_RESTIC=/path/to/restic."
+
+  export RESTIC_REPOSITORY=$repo
+  [[ -r $PASSWORD_FILE ]] && export RESTIC_PASSWORD_FILE=$PASSWORD_FILE
+  local -a hostopt=()
+  [[ -n $host ]] && hostopt=(--host "$host")
+
+  restic_cmd snapshots "${hostopt[@]}" >/dev/null || die "Could not read the repository (wrong password?)."
+  printf '\nThis restores backup %s over the system mounted at %s.\n' "'$snap'" "$target"
+  printf 'Files that belong to the new disk layout are kept from the new install:\n  %s\n\n' "${DISK_BOUND_EXCLUDES[*]}"
+  ask "Continue?" || exit 1
+
+  local -a excl=()
+  local e
+  for e in "${DISK_BOUND_EXCLUDES[@]}"; do excl+=(--exclude "$e"); done
+  local source=$snap
+  [[ -n $SRC_PREFIX ]] && source="$snap:$SRC_PREFIX"
+  restic_cmd restore "$source" "${hostopt[@]}" --target "$target" "${excl[@]}" || die "Restore failed."
+
+  cat <<MSG
+
+Restore complete. To make the restored system bootable, run:
+
+  arch-chroot $target
+  mkinitcpio -P
+  limine-update         # Omarchy's bootloader; rebuilds boot entries
+  exit
+
+Then reboot. Your installed packages, settings and files are as they were in
+the backup; disk-specific files come from the new installation.
+MSG
+}
+
+# Run on a freshly installed Omarchy to bring back packages, settings and files.
+cmd_migrate() {
+  require_root migrate
+  local snap=latest user=${SUDO_USER:-} packages=1
+  while (( $# )); do
+    case $1 in
+      --snapshot)      snap=$2; shift 2 ;;
+      --user)          user=$2; shift 2 ;;
+      --skip-packages) packages=0; shift ;;
+      --yes|-y)        ASSUME_YES=1; shift ;;
+      *) die "Unknown option $1" ;;
+    esac
+  done
+  [[ -n $user && $user != root ]] || die "Run with sudo from your user account, or pass --user NAME."
+  local new_home new_uid
+  new_home=$(getent passwd "$user" | cut -d: -f6)
+  new_uid=$(getent passwd "$user" | cut -d: -f3)
+  [[ -n $new_home ]] || die "User '$user' does not exist on this computer. Create it first."
+
+  load_config_or_die
+  mount_drive; use_repo
+  repo_exists || die "No backups found at $RESTIC_REPOSITORY"
+  restic_cmd cat config >/dev/null 2>&1 || die "Could not open the backups (wrong password?). Run: sudo hindsight setup"
+
+  local tmp; tmp=$(mktemp -d)
+  local f
+  for f in pkglist-native.txt pkglist-foreign.txt users.txt enabled-units.txt; do
+    restic_cmd dump --host "$HOST_ID" "$snap" "$SRC_PREFIX$SYSTEM_META/$f" >"$tmp/$f" 2>/dev/null || : >"$tmp/$f"
+  done
+
+  local old_home old_uid
+  old_home=$(awk -F: -v u="$user" '$1==u {print $3}' "$tmp/users.txt" | head -n1)
+  old_uid=$(awk -F: -v u="$user" '$1==u {print $2}' "$tmp/users.txt" | head -n1)
+  [[ -n $old_home ]] || old_home="/home/$user"
+
+  echo "Migrating from backup '$snap' of '$HOST_ID' for user '$user'."
+  echo
+
+  # 1. Packages
+  if (( packages )); then
+    if [[ -s $tmp/pkglist-native.txt ]] && ask "Install the $(wc -l <"$tmp/pkglist-native.txt") official packages from the backup?"; then
+      pacman -Sy
+      comm -12 <(sort -u "$tmp/pkglist-native.txt") <(pacman -Slq | sort -u) >"$tmp/native.avail"
+      local -a noconfirm=()
+      (( ASSUME_YES )) && noconfirm=(--noconfirm)
+      pacman -S --needed "${noconfirm[@]}" - <"$tmp/native.avail" || warn "Some packages failed to install."
+    fi
+    if [[ -s $tmp/pkglist-foreign.txt ]] && have yay && ask "Install the $(wc -l <"$tmp/pkglist-foreign.txt") AUR/other packages with yay?"; then
+      sudo -u "$user" yay -S --needed - <"$tmp/pkglist-foreign.txt" || warn "Some AUR packages failed to install."
+    fi
+  fi
+
+  # 2. Home folder
+  if ask "Restore your home folder ($old_home → $new_home)? Existing files there are overwritten."; then
+    mkdir -p "$TARGET_ROOT$new_home"
+    restic_cmd restore "$snap:$SRC_PREFIX$old_home" --host "$HOST_ID" --target "$TARGET_ROOT$new_home" \
+      || warn "Home restore reported errors."
+    if [[ -n $old_uid && $old_uid != "$new_uid" ]]; then
+      chown -R "$user": "$TARGET_ROOT$new_home"
+    fi
+  fi
+
+  # 3. System settings
+  if ask "Restore system settings in /etc (keeping this disk's fstab, crypttab and boot setup)?"; then
+    local -a excl=()
+    mapfile -t excl < <(relative_excludes /etc)
+    restore_subtree "$snap" /etc "${excl[@]}" || warn "/etc restore reported errors."
+  fi
+
+  # 4. Machine state: Bluetooth pairings, Wi-Fi, fingerprints, ...
+  local -a found=()
+  for f in "${MIGRATE_EXTRAS[@]}"; do snapshot_has "$snap" "$f" && found+=("$f"); done
+  if (( ${#found[@]} )) && ask "Restore device pairings and machine state (${found[*]})?"; then
+    for f in "${found[@]}"; do restore_subtree "$snap" "$f" || warn "$f restore reported errors."; done
+  fi
+
+  # 5. Services that were enabled before
+  if [[ -s $tmp/enabled-units.txt && -z ${HINDSIGHT_NO_SYSTEMD:-} ]]; then
+    local -a units=()
+    local u
+    while read -r u _; do
+      [[ -n $u && $u != *@.* ]] || continue
+      systemctl cat "$u" >/dev/null 2>&1 || continue
+      systemctl is-enabled -q "$u" 2>/dev/null && continue
+      units+=("$u")
+    done <"$tmp/enabled-units.txt"
+    if (( ${#units[@]} )) && ask "Re-enable ${#units[@]} services that were enabled before (${units[*]:0:6}…)?"; then
+      systemctl enable "${units[@]}" || warn "Some services could not be enabled."
+    fi
+  fi
+
+  rm -rf "$tmp"
+  echo
+  echo "Migration finished. Reboot to load everything."
+}
+
+# ----------------------------------------------------------------- setup ---
+
+list_candidate_partitions() {
+  lsblk -J -b -o NAME,PATH,UUID,FSTYPE,LABEL,SIZE,TRAN,HOTPLUG,TYPE,MODEL 2>/dev/null | jq -r '
+    .blockdevices[]
+    | select(.type == "disk" and (.tran == "usb" or .hotplug == true or .hotplug == "1"))
+    | . as $d
+    | (.children // [])[]
+    | select(.uuid != null and .fstype != null and .size > 2000000000)
+    | select(.fstype | test("^(exfat|ext4|btrfs|xfs|ntfs|ntfs3|f2fs|vfat)$"))
+    | "\(.path)\t\(.uuid)\t\(.fstype)\t\(.size)\t\(.label // "")\t\($d.model // "")"'
+}
+
+cmd_setup() {
+  require_root setup
+  have jq || die "jq is required (sudo pacman -S jq)."
+  have "$RESTIC" || die "restic is not installed (sudo pacman -S restic)."
+  local uuid=""
+  [[ ${1:-} == --uuid ]] && uuid=${2:-}
+
+  load_config
+  local had_config=0
+  [[ -f $CONFIG_FILE ]] && had_config=1
+
+  if [[ -z $uuid ]]; then
+    local -a rows=() labels=()
+    mapfile -t rows < <(list_candidate_partitions)
+    (( ${#rows[@]} )) || die "No external drive found. Connect your backup drive and try again."
+    local r path fs size label model
+    for r in "${rows[@]}"; do
+      IFS=$'\t' read -r path _ fs size label model <<<"$r"
+      labels+=("$(printf '%-12s %8s  %-6s %-12s %s' "$path" "$(human_bytes "$size")" "$fs" "${label:-—}" "$model")")
+    done
+    local pick
+    pick=$(choose "Which drive should Hindsight back up to?" "${labels[@]}") || exit 1
+    local i
+    for i in "${!labels[@]}"; do
+      [[ ${labels[$i]} == "$pick" ]] && uuid=$(cut -f2 <<<"${rows[$i]}")
+    done
+  fi
+  [[ -n $uuid ]] || die "No drive chosen."
+  DRIVE_UUID=$uuid
+  REPOSITORY=""
+
+  local fstype; fstype=$(lsblk -no FSTYPE "/dev/disk/by-uuid/$uuid" 2>/dev/null)
+  [[ $fstype == vfat ]] && warn "FAT32 drives work but are slow and fragile; exFAT or ext4 is better."
+
+  mkdir -p "$RUN_DIR" "$STATE_DIR" "$CACHE_DIR" "$ETC_DIR"
+  chmod 755 "$RUN_DIR" "$STATE_DIR"; chmod 755 "$ETC_DIR"
+  mount_drive
+
+  # Which backup set on this drive belongs to this computer?
+  local base=$MNT/$REPO_DIR_NAME
+  local -a hosts=()
+  local d
+  for d in "$base"/*/; do [[ -f $d/config ]] && hosts+=("$(basename "$d")"); done
+  local me; me=$(hostname 2>/dev/null || cat /etc/hostname)
+  if [[ ! -f $base/$HOST_ID/config ]] && (( ${#hosts[@]} )); then
+    local newopt="Start a new backup set for this computer ($me)"
+    local -a opts=("$newopt")
+    for d in "${hosts[@]}"; do opts+=("Use the existing backups of '$d'"); done
+    local pick; pick=$(choose "This drive already has backups. Which should this computer use?" "${opts[@]}") || exit 1
+    if [[ $pick == "$newopt" ]]; then HOST_ID=$me
+    else HOST_ID=$(sed -E "s/^Use the existing backups of '(.*)'$/\1/" <<<"$pick"); fi
+  fi
+  use_repo
+
+  local pw=""
+  if repo_exists; then
+    echo "Found existing backups for '$HOST_ID' on this drive."
+    if [[ -r $PASSWORD_FILE ]] && restic_cmd cat config >/dev/null 2>&1; then
+      echo "The saved password unlocks them."
+    else
+      unset RESTIC_PASSWORD_FILE
+      pw=$(read_secret "Backup password")
+      RESTIC_PASSWORD=$pw restic_cmd cat config >/dev/null 2>&1 || die "That password does not unlock these backups."
+    fi
+  else
+    echo
+    echo "Backups are encrypted. Choose a password — you will need it to restore"
+    echo "on another computer, so store it in your password manager."
+    echo "Leave it empty to generate a strong one."
+    pw=$(read_secret "New backup password")
+    if [[ -z $pw ]]; then
+      pw=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | cut -c1-28)
+      echo
+      echo "Your backup password is:   $pw"
+      echo "Write it down or save it in your password manager now."
+      echo
+    else
+      local pw2; pw2=$(read_secret "Repeat password")
+      [[ $pw == "$pw2" ]] || die "The passwords don't match."
+    fi
+  fi
+
+  if [[ -n $pw ]]; then
+    ( umask 077; printf '%s' "$pw" >"$PASSWORD_FILE" )
+    chmod 600 "$PASSWORD_FILE"
+    export RESTIC_PASSWORD_FILE=$PASSWORD_FILE
+  fi
+
+  if ! repo_exists; then
+    mkdir -p "$base"
+    log "Creating the backup repository at $RESTIC_REPOSITORY"
+    restic_cmd init >/dev/null || die "Could not create the backup repository."
+  fi
+
+  write_config
+  write_default_excludes
+  write_drive_extras
+  install_udev_rule
+  status_update '.configured_at=now | .state=(.state // "idle")'
+
+  if have systemctl && [[ -z ${HINDSIGHT_NO_SYSTEMD:-} ]]; then
+    systemctl daemon-reload
+    systemctl enable --now hindsight-backup.timer >/dev/null 2>&1 || warn "Could not enable hindsight-backup.timer."
+  fi
+
+  echo
+  echo "Hindsight is set up. It backs up every $INTERVAL_MINUTES minutes while the drive is connected,"
+  echo "and as soon as you plug it in. Settings: $CONFIG_FILE"
+  (( had_config )) && echo "(Your previous settings were replaced; excludes were kept.)"
+  if [[ -z ${HINDSIGHT_NO_SYSTEMD:-} ]] && confirm "Start the first backup now?"; then
+    systemctl start --no-block hindsight-backup-now.service
+    echo "Started. Watch it in the bar, or run: hindsight status"
+  fi
+}
+
+install_udev_rule() {
+  [[ -n ${HINDSIGHT_NO_SYSTEMD:-} ]] && return 0
+  cat >"$UDEV_RULE" <<EOF
+# Hindsight: start a backup when the backup drive is connected.
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_UUID}=="$DRIVE_UUID", TAG+="systemd", ENV{SYSTEMD_WANTS}+="hindsight-backup.service"
+EOF
+  udevadm control --reload 2>/dev/null
+}
+
+# ----------------------------------------------------------------- eject ---
+
+cmd_eject() {
+  load_config_or_die
+  local bpid; bpid=$(status_get .pid "")
+  if [[ $(status_get .state idle) == running && -n $bpid && -d /proc/$bpid ]]; then
+    die "A backup is running. Wait for it to finish first."
+  fi
+  drive_present || { echo "The backup drive is not connected."; return 0; }
+  local dev; dev=$(readlink -f "$(drive_device)")
+  if findmnt -rn -S "UUID=$DRIVE_UUID" >/dev/null; then
+    udisksctl unmount -b "$dev" || die "Could not unmount the drive (is something using it?)."
+  fi
+  local disk; disk=/dev/$(lsblk -no PKNAME "$dev" | head -n1)
+  udisksctl power-off -b "$disk" 2>/dev/null || true
+  echo "The backup drive can be unplugged."
+}
+
+# ------------------------------------------------------------------ menu ---
+
+cmd_menu() {
+  local -a items=(
+    "Back Up Now"
+    "Browse Backups"
+    "Restore a File or Folder"
+    "List Backups"
+    "Show Last Backup Log"
+    "Eject Backup Drive"
+    "Choose Backup Drive / Settings"
+    "Close"
+  )
+  local pick
+  while true; do
+    clear
+    cmd_status; echo
+    pick=$(choose "What would you like to do? (Esc closes)" "${items[@]}") || return 0
+    echo
+    case $pick in
+      "Back Up Now")              cmd_now --follow ;;
+      "Browse Backups")
+        echo "Opening your backups. You may be asked for your password."
+        echo "Reading the drive can take a minute while a backup is running…"
+        cmd_browse ;;
+      "Restore a File or Folder") menu_restore ;;
+      "List Backups")             cmd_list ;;
+      "Show Last Backup Log")     tail -n 40 "$LOG_FILE" 2>/dev/null || echo "No log yet." ;;
+      "Eject Backup Drive")       cmd_eject ;;
+      "Choose Backup Drive / Settings")
+        echo "Setup needs administrator access; enter your password if asked."
+        sudo "$SELF" setup
+        echo; echo "Advanced settings: $CONFIG_FILE and $EXCLUDE_FILE" ;;
+      *) return 0 ;;
+    esac
+    echo
+    read -r -s -n 1 -p "Press any key to go back…" _ </dev/tty
+  done
+}
+
+menu_restore() {
+  local path
+  if have gum; then
+    path=$(gum input --placeholder "$HOME/Documents/report.odt" --prompt "File or folder to restore: " --width 80)
+  else
+    read -r -e -p "File or folder to restore: " path
+  fi
+  [[ -n $path ]] || return 0
+  path=$(realpath -m "${path/#\~/$HOME}")
+  local where
+  where=$(choose "Restore where?" "Next to my files, in ~/Restored (safe)" "Over the current version (in place)") || return 0
+  echo "Restoring needs administrator access; enter your password if asked."
+  echo "Reading the drive can take a minute while a backup is running…"
+  if [[ $where == Over* ]]; then
+    sudo "$SELF" restore --in-place "$path"
+  else
+    sudo "$SELF" restore "$path"
+  fi
+}
+
+# ------------------------------------------------------------------ main ---
+
+usage() {
+  cat <<EOF
+Hindsight $VERSION — Time Machine-style backups for Omarchy
+
+Everyday:
+  hindsight status [--json]        Show the last backup and the drive's state
+  hindsight now                    Start a backup right away
+  hindsight browse                 Open your backups in the file manager
+  hindsight menu                   Interactive menu (what the bar icon opens)
+  hindsight eject                  Safely unmount the backup drive
+
+Needs sudo:
+  hindsight setup [--uuid UUID]    Choose the backup drive and password
+  hindsight backup [--auto]        Run a backup in the foreground
+  hindsight list                   List backups
+  hindsight restore [--snapshot ID] [--to DIR | --in-place] PATH...
+                                   Restore files (default: into ~/Restored/<date>)
+  hindsight migrate                Rebuild a fresh Omarchy install from a backup
+  hindsight restore-system --repo DIR --target /mnt
+                                   Full restore from a live USB
+  hindsight check                  Verify the backup repository
+EOF
+}
+
+main() {
+  local cmd=${1:-help}
+  (( $# )) && shift
+  case $cmd in
+    backup)          cmd_backup "$@" ;;
+    status)          cmd_status "$@" ;;
+    now)             cmd_now "$@" ;;
+    list|snapshots)  cmd_list "$@" ;;
+    check)           cmd_check "$@" ;;
+    browse)          cmd_browse "$@" ;;
+    restore)         cmd_restore "$@" ;;
+    restore-system)  cmd_restore_system "$@" ;;
+    migrate)         cmd_migrate "$@" ;;
+    setup)           cmd_setup "$@" ;;
+    eject)           cmd_eject "$@" ;;
+    menu)            cmd_menu "$@" ;;
+    _mount)          cmd__mount "$@" ;;
+    _umount)         cmd__umount "$@" ;;
+    version|--version) echo "hindsight $VERSION" ;;
+    help|-h|--help)  usage ;;
+    *)               usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

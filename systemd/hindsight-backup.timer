@@ -1,0 +1,11 @@
+[Unit]
+Description=Hindsight hourly backup check
+
+[Timer]
+OnCalendar=hourly
+OnStartupSec=10min
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

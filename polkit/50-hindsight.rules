@@ -1,0 +1,13 @@
+// Hindsight: let the logged-in desktop user start or stop a backup from the
+// bar without a password. Nothing else about the backups is exposed.
+polkit.addRule(function (action, subject) {
+  if (action.id == "org.freedesktop.systemd1.manage-units" &&
+      subject.local && subject.active && subject.isInGroup("wheel")) {
+    var unit = action.lookup("unit");
+    var verb = action.lookup("verb");
+    if ((unit == "hindsight-backup-now.service" || unit == "hindsight-backup.service") &&
+        (verb == "start" || verb == "stop")) {
+      return polkit.Result.YES;
+    }
+  }
+});
